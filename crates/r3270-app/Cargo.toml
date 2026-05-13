@@ -1,0 +1,18 @@
+[package]
+name = "r3270-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+eframe.workspace = true
+egui.workspace = true
+r3270-core = { path = "../r3270-core" }
+r3270-filetransfer = { path = "../r3270-filetransfer" }
+r3270-net = { path = "../r3270-net" }
+serde.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing-subscriber.workspace = true
+
