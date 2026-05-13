@@ -9,6 +9,14 @@ pub enum TransferError {
     MissingLocalFile,
     #[error("unsupported host kind for command builder")]
     UnsupportedHostKind,
+    #[error("DFT frame is shorter than header")]
+    ShortDftFrame,
+    #[error("DFT frame length mismatch")]
+    InvalidDftLength,
+    #[error("host transfer error: {0}")]
+    HostError(String),
+    #[error("local file IO failed: {0}")]
+    LocalIo(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +82,37 @@ pub struct IndFileRequest {
     pub mode: TransferMode,
     pub host_kind: HostKind,
     pub options: TransferOptions,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DftDirection {
+    Upload,
+    Download,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DftStatus {
+    Started,
+    Running,
+    Finished,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DftProgress {
+    pub direction: DftDirection,
+    pub status: DftStatus,
+    pub bytes_done: u64,
+    pub bytes_total: Option<u64>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DftFrame {
+    pub request_id: u16,
+    pub flags: u8,
+    pub payload: Vec<u8>,
 }
 
 impl Default for IndFileRequest {
@@ -145,6 +184,93 @@ impl IndFileRequest {
         parts.extend(self.options.extra_options.iter().cloned());
         Ok(parts.join(" "))
     }
+
+    pub fn dft_direction(&self) -> DftDirection {
+        match self.direction {
+            TransferDirection::SendToHost => DftDirection::Upload,
+            TransferDirection::ReceiveFromHost => DftDirection::Download,
+        }
+    }
+}
+
+impl DftFrame {
+    pub fn new(request_id: u16, flags: u8, payload: Vec<u8>) -> Self {
+        Self {
+            request_id,
+            flags,
+            payload,
+        }
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let length = self.payload.len() + 5;
+        let mut out = Vec::with_capacity(length);
+        out.extend_from_slice(&(length as u16).to_be_bytes());
+        out.extend_from_slice(&self.request_id.to_be_bytes());
+        out.push(self.flags);
+        out.extend_from_slice(&self.payload);
+        out
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self, TransferError> {
+        if input.len() < 5 {
+            return Err(TransferError::ShortDftFrame);
+        }
+        let length = u16::from_be_bytes([input[0], input[1]]) as usize;
+        if length != input.len() {
+            return Err(TransferError::InvalidDftLength);
+        }
+        Ok(Self {
+            request_id: u16::from_be_bytes([input[2], input[3]]),
+            flags: input[4],
+            payload: input[5..].to_vec(),
+        })
+    }
+}
+
+pub fn prepare_upload_payload(bytes: &[u8], mode: TransferMode, crlf: bool) -> Vec<u8> {
+    if mode == TransferMode::Binary {
+        return bytes.to_vec();
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    if crlf {
+        normalized.replace('\n', "\r\n").into_bytes()
+    } else {
+        normalized.into_bytes()
+    }
+}
+
+pub fn parse_host_message(
+    message: &str,
+    direction: DftDirection,
+) -> Result<DftProgress, TransferError> {
+    let upper = message.to_ascii_uppercase();
+    if upper.contains("ERROR") || upper.contains("FAILED") {
+        return Err(TransferError::HostError(message.trim().to_owned()));
+    }
+    let status = if upper.contains("COMPLETE") || upper.contains("SUCCESS") {
+        DftStatus::Finished
+    } else if upper.contains("CANCEL") {
+        DftStatus::Cancelled
+    } else if upper.contains("START") {
+        DftStatus::Started
+    } else {
+        DftStatus::Running
+    };
+    let bytes_done = upper
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .next()
+        .and_then(|part| part.parse().ok())
+        .unwrap_or(0);
+    Ok(DftProgress {
+        direction,
+        status,
+        bytes_done,
+        bytes_total: None,
+        message: message.trim().to_owned(),
+    })
 }
 
 fn quote_host_file(host_file: &str) -> String {
@@ -197,5 +323,27 @@ mod tests {
             request.tso_command().unwrap(),
             "IND$FILE PUT 'HLQ.BIN' RECFM(F) LRECL(80) BLKSIZE(3120) SPACE(5,1)"
         );
+    }
+
+    #[test]
+    fn dft_frame_round_trips() {
+        let frame = DftFrame::new(7, 0x80, b"payload".to_vec());
+        assert_eq!(DftFrame::decode(&frame.encode()).unwrap(), frame);
+    }
+
+    #[test]
+    fn text_payload_normalizes_crlf() {
+        assert_eq!(
+            prepare_upload_payload(b"a\nb\rc\r\nd", TransferMode::Text, true),
+            b"a\r\nb\r\nc\r\nd"
+        );
+    }
+
+    #[test]
+    fn host_message_reports_errors() {
+        assert!(parse_host_message("ERROR 12 failed", DftDirection::Download).is_err());
+        let progress = parse_host_message("4096 bytes complete", DftDirection::Download).unwrap();
+        assert_eq!(progress.status, DftStatus::Finished);
+        assert_eq!(progress.bytes_done, 4096);
     }
 }
