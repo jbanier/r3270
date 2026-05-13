@@ -26,12 +26,35 @@ pub type SessionStream = Pin<Box<dyn AsyncReadWrite>>;
 pub enum SessionCommand {
     InputText(String),
     SendAid(AidKey),
+    Backspace,
     MoveCursor { row: u16, col: u16 },
+    MoveCursorRelative { row_delta: i16, col_delta: i16 },
+    Home,
+    Tab,
+    BackTab,
+    ResetKeyboard,
+    SetInsertMode(bool),
+    ToggleInsertMode,
+    EraseEof,
+    EraseInput,
     Raw3270(Vec<u8>),
     Disconnect,
 }
 
 pub async fn run_session(
+    config: SessionConfig,
+    commands: mpsc::UnboundedReceiver<SessionCommand>,
+    events: mpsc::UnboundedSender<HostEvent>,
+) -> Result<()> {
+    let result = run_session_inner(config, commands, events.clone()).await;
+    if let Err(err) = &result {
+        send_event(&events, HostEvent::ProtocolError(sanitize_error(err)));
+    }
+    send_event(&events, HostEvent::Disconnected);
+    result
+}
+
+async fn run_session_inner(
     config: SessionConfig,
     mut commands: mpsc::UnboundedReceiver<SessionCommand>,
     events: mpsc::UnboundedSender<HostEvent>,
@@ -59,7 +82,6 @@ pub async fn run_session(
             read = stream.read(&mut read_buf) => {
                 let read = read?;
                 if read == 0 {
-                    send_event(&events, HostEvent::Disconnected);
                     return Ok(());
                 }
                 for event in parser.feed(&read_buf[..read]) {
@@ -92,15 +114,65 @@ pub async fn run_session(
                 };
                 match command {
                     SessionCommand::Disconnect => return Ok(()),
+                    SessionCommand::Backspace => {
+                        screen.backspace();
+                        send_event(&events, HostEvent::Screen(screen.clone()));
+                        send_oia(&events, mode, &screen, "Ready");
+                    }
                     SessionCommand::MoveCursor { row, col } => {
                         screen.set_cursor(row, col);
                         send_event(&events, HostEvent::Screen(screen.clone()));
+                        send_oia(&events, mode, &screen, "Ready");
+                    }
+                    SessionCommand::MoveCursorRelative { row_delta, col_delta } => {
+                        screen.move_cursor_relative(row_delta, col_delta);
+                        send_event(&events, HostEvent::Screen(screen.clone()));
+                        send_oia(&events, mode, &screen, "Ready");
+                    }
+                    SessionCommand::Home => {
+                        screen.home();
+                        send_event(&events, HostEvent::Screen(screen.clone()));
+                        send_oia(&events, mode, &screen, "Ready");
+                    }
+                    SessionCommand::Tab => {
+                        screen.tab();
+                        send_event(&events, HostEvent::Screen(screen.clone()));
+                        send_oia(&events, mode, &screen, "Ready");
+                    }
+                    SessionCommand::BackTab => {
+                        screen.backtab();
+                        send_event(&events, HostEvent::Screen(screen.clone()));
+                        send_oia(&events, mode, &screen, "Ready");
+                    }
+                    SessionCommand::ResetKeyboard => {
+                        screen.reset_keyboard();
+                        send_event(&events, HostEvent::Screen(screen.clone()));
+                        send_oia(&events, mode, &screen, "Ready");
+                    }
+                    SessionCommand::SetInsertMode(insert_mode) => {
+                        screen.set_insert_mode(insert_mode);
+                        send_oia(&events, mode, &screen, "Ready");
+                    }
+                    SessionCommand::ToggleInsertMode => {
+                        screen.toggle_insert_mode();
+                        send_oia(&events, mode, &screen, "Ready");
+                    }
+                    SessionCommand::EraseEof => {
+                        screen.erase_eof();
+                        send_event(&events, HostEvent::Screen(screen.clone()));
+                        send_oia(&events, mode, &screen, "Ready");
+                    }
+                    SessionCommand::EraseInput => {
+                        screen.erase_input();
+                        send_event(&events, HostEvent::Screen(screen.clone()));
+                        send_oia(&events, mode, &screen, "Ready");
                     }
                     SessionCommand::InputText(text) => {
                         for ch in text.chars() {
                             screen.input_char(ch);
                         }
                         send_event(&events, HostEvent::Screen(screen.clone()));
+                        send_oia(&events, mode, &screen, "Ready");
                     }
                     SessionCommand::SendAid(aid) => {
                         let payload = screen.aid_response(aid);
@@ -224,9 +296,21 @@ fn send_oia(
     let _ = events.send(HostEvent::Oia(OiaState {
         connection,
         keyboard_locked: screen.keyboard_locked(),
-        insert_mode: false,
+        insert_mode: screen.insert_mode(),
         message: message.into(),
     }));
+}
+
+fn sanitize_error(err: &anyhow::Error) -> String {
+    let message = err.to_string();
+    if message.contains("certificate")
+        || message.contains("invalid peer")
+        || message.contains("dns name")
+    {
+        "TLS certificate validation failed for host".to_owned()
+    } else {
+        message
+    }
 }
 
 pub fn default_session_config(host: impl Into<String>, port: u16) -> SessionConfig {

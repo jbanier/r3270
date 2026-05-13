@@ -37,10 +37,28 @@ struct ProfileStore {
     profiles: Vec<HostProfile>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AppPreferences {
+    font_size: f32,
+    cell_width: f32,
+    cell_height: f32,
+}
+
+impl Default for AppPreferences {
+    fn default() -> Self {
+        Self {
+            font_size: 16.0,
+            cell_width: 9.6,
+            cell_height: 18.0,
+        }
+    }
+}
+
 struct R3270App {
     runtime: Runtime,
     profiles: Vec<HostProfile>,
     themes: Vec<ThemeConfig>,
+    preferences: AppPreferences,
     tabs: Vec<TerminalTab>,
     active_tab: usize,
     next_tab_id: u64,
@@ -65,11 +83,13 @@ impl R3270App {
         let profiles = load_profiles().unwrap_or_else(|| vec![HostProfile::default()]);
         let profile_editor = profiles.first().cloned().unwrap_or_default();
         let themes = ThemeConfig::built_ins();
+        let preferences = load_preferences().unwrap_or_default();
         let first_tab = TerminalTab::new(1, profile_editor.clone());
         Self {
             runtime: Runtime::new().expect("create Tokio runtime"),
             profiles,
             themes,
+            preferences,
             tabs: vec![first_tab],
             active_tab: 0,
             next_tab_id: 2,
@@ -160,11 +180,8 @@ impl R3270App {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let mut config = SessionConfig::default();
         config.profile = self.tabs[idx].profile.clone();
-        let event_tx_for_error = event_tx.clone();
         self.runtime.spawn(async move {
-            if let Err(err) = run_session(config, command_rx, event_tx).await {
-                let _ = event_tx_for_error.send(HostEvent::ProtocolError(err.to_string()));
-            }
+            let _ = run_session(config, command_rx, event_tx).await;
         });
         let tab = &mut self.tabs[idx];
         tab.command_tx = Some(command_tx);
@@ -183,29 +200,28 @@ impl R3270App {
         }
     }
 
-    fn send_input_text(&mut self, text: String) {
+    fn reconnect_active_tab(&mut self) {
+        self.disconnect_active_tab();
+        self.connect_active_tab();
+    }
+
+    fn send_session_command(&mut self, command: SessionCommand) {
         let Some(tab) = self.active_tab_mut() else {
             return;
         };
         if let Some(tx) = &tab.command_tx {
-            let _ = tx.send(SessionCommand::InputText(text));
+            let _ = tx.send(command);
         } else {
-            for ch in text.chars() {
-                tab.screen.input_char(ch);
-            }
+            apply_local_command(tab, &command);
         }
     }
 
+    fn send_input_text(&mut self, text: String) {
+        self.send_session_command(SessionCommand::InputText(text));
+    }
+
     fn send_aid(&mut self, aid: AidKey) {
-        let Some(tab) = self.active_tab_mut() else {
-            return;
-        };
-        if let Some(tx) = &tab.command_tx {
-            let _ = tx.send(SessionCommand::SendAid(aid));
-        } else {
-            let _ = tab.screen.aid_response(aid);
-            tab.oia.keyboard_locked = tab.screen.keyboard_locked();
-        }
+        self.send_session_command(SessionCommand::SendAid(aid));
     }
 
     fn send_transfer_command(&mut self) {
@@ -220,7 +236,10 @@ impl R3270App {
     }
 
     fn handle_keyboard(&mut self, ctx: &egui::Context) {
-        if ctx.egui_wants_keyboard_input() {
+        let terminal_has_focus = self
+            .active_tab()
+            .is_some_and(|tab| ctx.memory(|memory| memory.has_focus(terminal_focus_id(tab.id))));
+        if !terminal_has_focus && ctx.egui_wants_keyboard_input() {
             return;
         }
         let events = ctx.input(|input| input.events.clone());
@@ -235,29 +254,88 @@ impl R3270App {
                 } => match key {
                     egui::Key::Enter => self.send_aid(AidKey::Enter),
                     egui::Key::Escape => self.send_aid(AidKey::Attn),
-                    egui::Key::F1 => self.send_aid(AidKey::Pf(1)),
-                    egui::Key::F2 => self.send_aid(AidKey::Pf(2)),
-                    egui::Key::F3 => self.send_aid(AidKey::Pf(3)),
-                    egui::Key::F4 => self.send_aid(AidKey::Pf(4)),
-                    egui::Key::F5 => self.send_aid(AidKey::Pf(5)),
-                    egui::Key::F6 => self.send_aid(AidKey::Pf(6)),
-                    egui::Key::F7 => self.send_aid(AidKey::Pf(7)),
-                    egui::Key::F8 => self.send_aid(AidKey::Pf(8)),
-                    egui::Key::F9 => self.send_aid(AidKey::Pf(9)),
-                    egui::Key::F10 => self.send_aid(AidKey::Pf(10)),
-                    egui::Key::F11 => self.send_aid(AidKey::Pf(11)),
-                    egui::Key::F12 => self.send_aid(AidKey::Pf(12)),
+                    egui::Key::Tab if modifiers.shift => {
+                        self.send_session_command(SessionCommand::BackTab)
+                    }
+                    egui::Key::Tab => self.send_session_command(SessionCommand::Tab),
+                    egui::Key::Home => self.send_session_command(SessionCommand::Home),
+                    egui::Key::ArrowUp => {
+                        self.send_session_command(SessionCommand::MoveCursorRelative {
+                            row_delta: -1,
+                            col_delta: 0,
+                        })
+                    }
+                    egui::Key::ArrowDown => {
+                        self.send_session_command(SessionCommand::MoveCursorRelative {
+                            row_delta: 1,
+                            col_delta: 0,
+                        })
+                    }
+                    egui::Key::ArrowLeft => {
+                        self.send_session_command(SessionCommand::MoveCursorRelative {
+                            row_delta: 0,
+                            col_delta: -1,
+                        })
+                    }
+                    egui::Key::ArrowRight => {
+                        self.send_session_command(SessionCommand::MoveCursorRelative {
+                            row_delta: 0,
+                            col_delta: 1,
+                        })
+                    }
+                    egui::Key::Insert => {
+                        self.send_session_command(SessionCommand::ToggleInsertMode)
+                    }
+                    egui::Key::Delete => self.send_session_command(SessionCommand::EraseEof),
+                    egui::Key::F1 => self.send_function_or_pa(1, modifiers),
+                    egui::Key::F2 => self.send_function_or_pa(2, modifiers),
+                    egui::Key::F3 => self.send_function_or_pa(3, modifiers),
+                    egui::Key::F4 => self.send_function_or_pa(4, modifiers),
+                    egui::Key::F5 => self.send_function_or_pa(5, modifiers),
+                    egui::Key::F6 => self.send_function_or_pa(6, modifiers),
+                    egui::Key::F7 => self.send_function_or_pa(7, modifiers),
+                    egui::Key::F8 => self.send_function_or_pa(8, modifiers),
+                    egui::Key::F9 => self.send_function_or_pa(9, modifiers),
+                    egui::Key::F10 => self.send_function_or_pa(10, modifiers),
+                    egui::Key::F11 => self.send_function_or_pa(11, modifiers),
+                    egui::Key::F12 => self.send_function_or_pa(12, modifiers),
+                    egui::Key::F13 => self.send_aid(AidKey::Pf(13)),
+                    egui::Key::F14 => self.send_aid(AidKey::Pf(14)),
+                    egui::Key::F15 => self.send_aid(AidKey::Pf(15)),
+                    egui::Key::F16 => self.send_aid(AidKey::Pf(16)),
+                    egui::Key::F17 => self.send_aid(AidKey::Pf(17)),
+                    egui::Key::F18 => self.send_aid(AidKey::Pf(18)),
+                    egui::Key::F19 => self.send_aid(AidKey::Pf(19)),
+                    egui::Key::F20 => self.send_aid(AidKey::Pf(20)),
+                    egui::Key::F21 => self.send_aid(AidKey::Pf(21)),
+                    egui::Key::F22 => self.send_aid(AidKey::Pf(22)),
+                    egui::Key::F23 => self.send_aid(AidKey::Pf(23)),
+                    egui::Key::F24 => self.send_aid(AidKey::Pf(24)),
                     egui::Key::L if modifiers.ctrl => self.send_aid(AidKey::Clear),
                     egui::Key::S if modifiers.ctrl => self.send_aid(AidKey::SysReq),
+                    egui::Key::R if modifiers.ctrl => {
+                        self.send_session_command(SessionCommand::ResetKeyboard)
+                    }
+                    egui::Key::U if modifiers.ctrl => {
+                        self.send_session_command(SessionCommand::EraseInput)
+                    }
                     egui::Key::Backspace => {
-                        if let Some(tab) = self.active_tab_mut() {
-                            tab.screen.backspace();
-                        }
+                        self.send_session_command(SessionCommand::Backspace);
                     }
                     _ => {}
                 },
                 _ => {}
             }
+        }
+    }
+
+    fn send_function_or_pa(&mut self, number: u8, modifiers: egui::Modifiers) {
+        if modifiers.ctrl && number <= 3 {
+            self.send_aid(AidKey::Pa(number));
+        } else if modifiers.shift {
+            self.send_aid(AidKey::Pf(number + 12));
+        } else {
+            self.send_aid(AidKey::Pf(number));
         }
     }
 
@@ -316,10 +394,14 @@ impl R3270App {
                     ui.add(egui::DragValue::new(&mut self.profile_editor.port).range(1..=65535));
                 });
                 ui.checkbox(&mut self.profile_editor.tls, "TLS");
-                ui.checkbox(
-                    &mut self.profile_editor.insecure_skip_verify,
-                    "Allow insecure TLS",
-                );
+                self.profile_editor.insecure_skip_verify = false;
+                ui.add_enabled_ui(false, |ui| {
+                    ui.checkbox(
+                        &mut self.profile_editor.insecure_skip_verify,
+                        "Allow insecure TLS",
+                    )
+                    .on_hover_text("Disabled until a verified certificate override is implemented");
+                });
                 ui.horizontal(|ui| {
                     ui.label("LU");
                     let lu = self.profile_editor.lu_name.get_or_insert_with(String::new);
@@ -388,7 +470,27 @@ impl R3270App {
                     if ui.button("Disconnect").clicked() {
                         self.disconnect_active_tab();
                     }
+                    if ui.button("Reconnect").clicked() {
+                        self.reconnect_active_tab();
+                    }
                 });
+
+                ui.separator();
+                ui.heading("Display");
+                ui.add(
+                    egui::Slider::new(&mut self.preferences.font_size, 10.0..=24.0).text("Font"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.preferences.cell_width, 7.0..=16.0)
+                        .text("Cell width"),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.preferences.cell_height, 12.0..=28.0)
+                        .text("Cell height"),
+                );
+                if ui.button("Save preferences").clicked() {
+                    let _ = save_preferences(&self.preferences);
+                }
 
                 ui.separator();
                 ui.heading("File Transfer");
@@ -443,6 +545,8 @@ impl R3270App {
                         "READY"
                     });
                     ui.separator();
+                    ui.monospace(if tab.oia.insert_mode { "INS" } else { "OVR" });
+                    ui.separator();
                     ui.monospace(format!("{}x{}", tab.screen.rows(), tab.screen.cols()));
                     ui.separator();
                     ui.monospace(format!("R{} C{}", cursor.row + 1, cursor.col + 1));
@@ -469,9 +573,14 @@ impl R3270App {
                 .find(|theme| theme.name == theme_name)
                 .unwrap_or(&self.themes[0])
                 .clone();
-            if let Some(tab) = self.active_tab_mut() {
-                render_terminal(ui, tab, &theme);
-            }
+            let preferences = self.preferences.clone();
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if let Some(tab) = self.active_tab_mut() {
+                        render_terminal(ui, tab, &theme, &preferences);
+                    }
+                });
         });
     }
 }
@@ -506,14 +615,55 @@ impl TerminalTab {
     }
 }
 
-fn render_terminal(ui: &mut egui::Ui, tab: &mut TerminalTab, theme: &ThemeConfig) {
-    let cell_w = 9.6_f32;
-    let cell_h = 18.0_f32;
+fn apply_local_command(tab: &mut TerminalTab, command: &SessionCommand) {
+    match command {
+        SessionCommand::InputText(text) => {
+            for ch in text.chars() {
+                tab.screen.input_char(ch);
+            }
+        }
+        SessionCommand::SendAid(aid) => {
+            let _ = tab.screen.aid_response(*aid);
+        }
+        SessionCommand::Backspace => {
+            tab.screen.backspace();
+        }
+        SessionCommand::MoveCursor { row, col } => tab.screen.set_cursor(*row, *col),
+        SessionCommand::MoveCursorRelative {
+            row_delta,
+            col_delta,
+        } => tab.screen.move_cursor_relative(*row_delta, *col_delta),
+        SessionCommand::Home => tab.screen.home(),
+        SessionCommand::Tab => tab.screen.tab(),
+        SessionCommand::BackTab => tab.screen.backtab(),
+        SessionCommand::ResetKeyboard => tab.screen.reset_keyboard(),
+        SessionCommand::SetInsertMode(insert_mode) => tab.screen.set_insert_mode(*insert_mode),
+        SessionCommand::ToggleInsertMode => tab.screen.toggle_insert_mode(),
+        SessionCommand::EraseEof => {
+            let _ = tab.screen.erase_eof();
+        }
+        SessionCommand::EraseInput => tab.screen.erase_input(),
+        SessionCommand::Raw3270(_) | SessionCommand::Disconnect => {}
+    }
+    tab.oia.keyboard_locked = tab.screen.keyboard_locked();
+    tab.oia.insert_mode = tab.screen.insert_mode();
+}
+
+fn render_terminal(
+    ui: &mut egui::Ui,
+    tab: &mut TerminalTab,
+    theme: &ThemeConfig,
+    preferences: &AppPreferences,
+) {
+    let cell_w = preferences.cell_width;
+    let cell_h = preferences.cell_height;
     let cols = tab.screen.cols() as usize;
     let rows = tab.screen.rows() as usize;
     let desired = Vec2::new(cols as f32 * cell_w, rows as f32 * cell_h);
-    let (rect, response) = ui.allocate_exact_size(desired, Sense::click());
+    let (_, rect) = ui.allocate_space(desired);
+    let response = ui.interact(rect, terminal_focus_id(tab.id), Sense::click());
     if response.clicked() {
+        response.request_focus();
         if let Some(pos) = response.interact_pointer_pos() {
             let col = ((pos.x - rect.left()) / cell_w).floor().max(0.0) as u16;
             let row = ((pos.y - rect.top()) / cell_h).floor().max(0.0) as u16;
@@ -527,7 +677,7 @@ fn render_terminal(ui: &mut egui::Ui, tab: &mut TerminalTab, theme: &ThemeConfig
 
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, color32(&theme.background));
-    let font = FontId::monospace(16.0);
+    let font = FontId::monospace(preferences.font_size);
     for (idx, cell) in tab.screen.cells().iter().enumerate() {
         let row = idx / cols;
         let col = idx % cols;
@@ -572,6 +722,18 @@ fn render_terminal(ui: &mut egui::Ui, tab: &mut TerminalTab, theme: &ThemeConfig
         Stroke::new(1.5, color32(&theme.cursor)),
         StrokeKind::Inside,
     );
+    if response.has_focus() {
+        painter.rect_stroke(
+            rect,
+            0.0,
+            Stroke::new(1.0, color32(&theme.selection)),
+            StrokeKind::Inside,
+        );
+    }
+}
+
+fn terminal_focus_id(tab_id: u64) -> egui::Id {
+    egui::Id::new(("terminal", tab_id))
 }
 
 fn foreground_for(attrs: CellAttrs, theme: &ThemeConfig) -> Color32 {
@@ -636,6 +798,22 @@ fn load_profiles() -> Option<Vec<HostProfile>> {
     let data = fs::read_to_string(path).ok()?;
     let store: ProfileStore = toml::from_str(&data).ok()?;
     Some(store.profiles)
+}
+
+fn load_preferences() -> Option<AppPreferences> {
+    let path = config_dir()?.join("preferences.toml");
+    let data = fs::read_to_string(path).ok()?;
+    toml::from_str(&data).ok()
+}
+
+fn save_preferences(preferences: &AppPreferences) -> std::io::Result<()> {
+    if let Some(dir) = config_dir() {
+        fs::create_dir_all(&dir)?;
+        let data = toml::to_string_pretty(preferences)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+        fs::write(dir.join("preferences.toml"), data)?;
+    }
+    Ok(())
 }
 
 fn save_profiles(profiles: &[HostProfile]) -> std::io::Result<()> {

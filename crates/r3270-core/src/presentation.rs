@@ -34,6 +34,14 @@ pub const EXT_HIGHLIGHTING: u8 = 0x41;
 pub const EXT_FOREGROUND: u8 = 0x42;
 pub const EXT_BACKGROUND: u8 = 0x45;
 
+const SF_READ_PARTITION: u8 = 0x01;
+const SF_QUERY_REPLY: u8 = 0x81;
+const QUERY_SUMMARY: u8 = 0x80;
+const QUERY_USABLE_AREA: u8 = 0x81;
+const QUERY_COLOR: u8 = 0x86;
+const QUERY_HIGHLIGHTING: u8 = 0x87;
+const QUERY_IMPLICIT_PARTITION: u8 = 0xa6;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PresentationError {
     #[error("empty 3270 data stream")]
@@ -230,6 +238,7 @@ pub struct PresentationSpace {
     write_addr: usize,
     codepage: CodePageKind,
     keyboard_locked: bool,
+    insert_mode: bool,
     current_attrs: CellAttrs,
     alarm: bool,
 }
@@ -249,6 +258,7 @@ impl PresentationSpace {
             write_addr: 0,
             codepage,
             keyboard_locked: false,
+            insert_mode: false,
             current_attrs: CellAttrs::default(),
             alarm: false,
         }
@@ -274,6 +284,10 @@ impl PresentationSpace {
         self.keyboard_locked
     }
 
+    pub fn insert_mode(&self) -> bool {
+        self.insert_mode
+    }
+
     pub fn alarm(&self) -> bool {
         self.alarm
     }
@@ -285,6 +299,62 @@ impl PresentationSpace {
     pub fn set_cursor(&mut self, row: u16, col: u16) {
         self.cursor_addr = self.cursor_to_addr(row, col);
         self.write_addr = self.cursor_addr;
+    }
+
+    pub fn move_cursor_relative(&mut self, row_delta: i16, col_delta: i16) {
+        let cursor = self.cursor();
+        let row = (cursor.row as i16 + row_delta).clamp(0, self.rows.saturating_sub(1) as i16);
+        let col = (cursor.col as i16 + col_delta).clamp(0, self.cols.saturating_sub(1) as i16);
+        self.set_cursor(row as u16, col as u16);
+    }
+
+    pub fn home(&mut self) {
+        let home = self
+            .fields()
+            .into_iter()
+            .find(|field| !field.attrs.protected)
+            .map(|field| self.next_addr(field.start))
+            .unwrap_or(0);
+        self.cursor_addr = home;
+        self.write_addr = home;
+    }
+
+    pub fn tab(&mut self) {
+        let next = self.next_unprotected_field(self.cursor_addr);
+        self.cursor_addr = next;
+        self.write_addr = next;
+    }
+
+    pub fn backtab(&mut self) {
+        let fields = self.fields();
+        let mut candidate = None;
+        for field in fields {
+            if !field.attrs.protected && field.start < self.cursor_addr {
+                candidate = Some(self.next_addr(field.start));
+            }
+        }
+        let addr = candidate.unwrap_or_else(|| {
+            self.fields()
+                .into_iter()
+                .rev()
+                .find(|field| !field.attrs.protected)
+                .map(|field| self.next_addr(field.start))
+                .unwrap_or(self.cursor_addr)
+        });
+        self.cursor_addr = addr;
+        self.write_addr = addr;
+    }
+
+    pub fn reset_keyboard(&mut self) {
+        self.keyboard_locked = false;
+    }
+
+    pub fn set_insert_mode(&mut self, insert_mode: bool) {
+        self.insert_mode = insert_mode;
+    }
+
+    pub fn toggle_insert_mode(&mut self) {
+        self.insert_mode = !self.insert_mode;
     }
 
     pub fn text_rows(&self) -> Vec<String> {
@@ -361,7 +431,7 @@ impl PresentationSpace {
             }
             CMD_READ_MODIFIED_ALL => Ok(Some(self.read_modified(AidKey::Enter, true))),
             CMD_WRITE_STRUCTURED_FIELD | CMD_WRITE_STRUCTURED_FIELD_ALT => {
-                Ok(Some(self.query_reply()))
+                Ok(Some(self.query_reply(body)))
             }
             other => Err(PresentationError::UnsupportedCommand(other)),
         }
@@ -377,11 +447,61 @@ impl PresentationSpace {
         if self.protected_at(self.cursor_addr) {
             return false;
         }
+        if self.insert_mode {
+            self.shift_field_right(self.cursor_addr);
+        }
         self.write_cell(self.cursor_addr, byte, ch, self.attrs_at(self.cursor_addr));
         self.mark_field_modified(self.cursor_addr);
         self.cursor_addr = self.next_addr(self.cursor_addr);
         self.write_addr = self.cursor_addr;
         true
+    }
+
+    pub fn erase_eof(&mut self) -> bool {
+        if self.protected_at(self.cursor_addr) {
+            return false;
+        }
+        let Some(field) = self.field_for_addr(self.cursor_addr) else {
+            return false;
+        };
+        let mut addr = self.cursor_addr;
+        while addr != self.next_addr(field.end) {
+            if self.cells[addr].field_attribute.is_some() || self.protected_at(addr) {
+                break;
+            }
+            let attrs = self.attrs_at(addr);
+            self.write_cell(addr, 0x40, ' ', attrs);
+            addr = self.next_addr(addr);
+        }
+        self.mark_field_modified(self.cursor_addr);
+        true
+    }
+
+    pub fn erase_input(&mut self) {
+        let fields = self.fields();
+        let mut first_unprotected = None;
+        for field in fields {
+            if field.attrs.protected {
+                continue;
+            }
+            first_unprotected.get_or_insert_with(|| self.next_addr(field.start));
+            let mut addr = self.next_addr(field.start);
+            while addr != self.next_addr(field.end) {
+                if self.cells[addr].field_attribute.is_some() {
+                    break;
+                }
+                let attrs = self.attrs_at(addr);
+                self.write_cell(addr, 0x40, ' ', attrs);
+                addr = self.next_addr(addr);
+            }
+            if let Some(cell) = self.cells.get_mut(field.start) {
+                cell.attrs.modified = false;
+            }
+        }
+        if let Some(addr) = first_unprotected {
+            self.cursor_addr = addr;
+            self.write_addr = addr;
+        }
     }
 
     pub fn backspace(&mut self) -> bool {
@@ -459,10 +579,10 @@ impl PresentationSpace {
     }
 
     fn apply_wcc(&mut self, wcc: u8, reset_mdt: bool) {
-        if wcc & 0x04 != 0 {
+        if wcc & 0x02 != 0 {
             self.keyboard_locked = false;
         }
-        if wcc & 0x02 != 0 {
+        if wcc & 0x04 != 0 {
             self.alarm = true;
         }
         if reset_mdt || wcc & 0x01 != 0 {
@@ -638,21 +758,59 @@ impl PresentationSpace {
         }
     }
 
-    fn query_reply(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.push(0x88);
-        out.push(0x00);
-        out.push(0x13);
-        out.push(0x81);
-        out.push(0x80);
-        out.extend_from_slice(&self.cols.to_be_bytes());
-        out.extend_from_slice(&self.rows.to_be_bytes());
-        out.push(0x86);
-        out.push(0x00);
-        out.push(0x08);
-        out.push(0x87);
-        out.push(0x00);
-        out.push(0x08);
+    fn query_reply(&self, request: &[u8]) -> Vec<u8> {
+        let mut out = vec![0x88];
+        let requested = requested_query_codes(request);
+        let include_all = requested.is_empty() || requested.contains(&QUERY_SUMMARY);
+        if include_all || requested.contains(&QUERY_SUMMARY) {
+            out.extend_from_slice(&structured_field(
+                SF_QUERY_REPLY,
+                &[
+                    QUERY_SUMMARY,
+                    QUERY_USABLE_AREA,
+                    QUERY_COLOR,
+                    QUERY_HIGHLIGHTING,
+                    QUERY_IMPLICIT_PARTITION,
+                ],
+            ));
+        }
+        if include_all || requested.contains(&QUERY_USABLE_AREA) {
+            let mut payload = vec![QUERY_USABLE_AREA, 0x00, 0x00, 0x00, 0x00];
+            payload.extend_from_slice(&self.cols.to_be_bytes());
+            payload.extend_from_slice(&self.rows.to_be_bytes());
+            payload.extend_from_slice(&self.cols.to_be_bytes());
+            payload.extend_from_slice(&self.rows.to_be_bytes());
+            out.extend_from_slice(&structured_field(SF_QUERY_REPLY, &payload));
+        }
+        if include_all || requested.contains(&QUERY_COLOR) {
+            out.extend_from_slice(&structured_field(
+                SF_QUERY_REPLY,
+                &[
+                    QUERY_COLOR,
+                    0x00,
+                    0xf1,
+                    0xf2,
+                    0xf3,
+                    0xf4,
+                    0xf5,
+                    0xf6,
+                    0xf7,
+                    0xf8,
+                ],
+            ));
+        }
+        if include_all || requested.contains(&QUERY_HIGHLIGHTING) {
+            out.extend_from_slice(&structured_field(
+                SF_QUERY_REPLY,
+                &[QUERY_HIGHLIGHTING, 0x00, 0xf1, 0xf2, 0xf4, 0xf8],
+            ));
+        }
+        if include_all || requested.contains(&QUERY_IMPLICIT_PARTITION) {
+            out.extend_from_slice(&structured_field(
+                SF_QUERY_REPLY,
+                &[QUERY_IMPLICIT_PARTITION, 0x00, 0x00, 0x00, 0x00],
+            ));
+        }
         out
     }
 
@@ -684,6 +842,27 @@ impl PresentationSpace {
             if let Some(cell) = self.cells.get_mut(field.start) {
                 cell.attrs.modified = true;
             }
+        }
+    }
+
+    fn shift_field_right(&mut self, addr: usize) {
+        let Some(field) = self.field_for_addr(addr) else {
+            return;
+        };
+        if field.attrs.protected {
+            return;
+        }
+        let end = field.end;
+        if addr >= end {
+            return;
+        }
+        let mut pos = end;
+        while pos > addr {
+            if self.cells[pos].field_attribute.is_some() {
+                break;
+            }
+            self.cells[pos] = self.cells[pos - 1].clone();
+            pos -= 1;
         }
     }
 
@@ -733,6 +912,33 @@ pub fn encode_address(addr: usize) -> [u8; 2] {
     [((addr >> 8) & 0x3f) as u8, (addr & 0xff) as u8]
 }
 
+fn structured_field(id: u8, payload: &[u8]) -> Vec<u8> {
+    let length = payload.len() + 3;
+    let mut out = Vec::with_capacity(length);
+    out.extend_from_slice(&(length as u16).to_be_bytes());
+    out.push(id);
+    out.extend_from_slice(payload);
+    out
+}
+
+fn requested_query_codes(request: &[u8]) -> Vec<u8> {
+    let mut requested = Vec::new();
+    let mut idx = 0;
+    while idx + 2 < request.len() {
+        let length = u16::from_be_bytes([request[idx], request[idx + 1]]) as usize;
+        if length < 3 || idx + length > request.len() {
+            break;
+        }
+        let id = request[idx + 2];
+        let payload = &request[idx + 3..idx + length];
+        if id == SF_READ_PARTITION {
+            requested.extend(payload.iter().copied().filter(|byte| *byte >= 0x80));
+        }
+        idx += length;
+    }
+    requested
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -744,7 +950,7 @@ mod tests {
     #[test]
     fn erase_write_writes_text_and_unlocks_keyboard() {
         let mut ps = screen();
-        ps.apply_host_data(&[CMD_ERASE_WRITE, 0x04, 0xc8, 0xc5, 0xd3, 0xd3, 0xd6])
+        ps.apply_host_data(&[CMD_ERASE_WRITE, 0x02, 0xc8, 0xc5, 0xd3, 0xd3, 0xd6])
             .unwrap();
         assert_eq!(&ps.text_rows()[0][0..5], "HELLO");
         assert!(!ps.keyboard_locked());
@@ -753,7 +959,7 @@ mod tests {
     #[test]
     fn sba_places_text_at_address() {
         let mut ps = screen();
-        let mut data = vec![CMD_ERASE_WRITE, 0x04, ORDER_SBA];
+        let mut data = vec![CMD_ERASE_WRITE, 0x02, ORDER_SBA];
         data.extend_from_slice(&encode_address(82));
         data.extend_from_slice(&[0xc1, 0xc2, 0xc3]);
         ps.apply_host_data(&data).unwrap();
@@ -765,7 +971,7 @@ mod tests {
         let mut ps = screen();
         ps.apply_host_data(&[
             CMD_ERASE_WRITE,
-            0x04,
+            0x02,
             ORDER_SF,
             0x20,
             0xc8,
@@ -787,9 +993,71 @@ mod tests {
     #[test]
     fn extended_color_is_applied() {
         let mut ps = screen();
-        ps.apply_host_data(&[CMD_ERASE_WRITE, 0x04, ORDER_SA, EXT_FOREGROUND, 0xf2, 0xc1])
+        ps.apply_host_data(&[CMD_ERASE_WRITE, 0x02, ORDER_SA, EXT_FOREGROUND, 0xf2, 0xc1])
             .unwrap();
         assert_eq!(ps.cells()[0].attrs.foreground, Color::Red);
+    }
+
+    #[test]
+    fn structured_field_query_reply_reports_capabilities() {
+        let mut ps = screen();
+        let reply = ps
+            .apply_host_data(&[CMD_WRITE_STRUCTURED_FIELD, 0x00, 0x04, 0x01, 0x80])
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply[0], 0x88);
+        assert!(reply.contains(&QUERY_SUMMARY));
+        assert!(reply.contains(&QUERY_USABLE_AREA));
+        assert!(reply.contains(&QUERY_COLOR));
+        assert!(reply.contains(&QUERY_HIGHLIGHTING));
+    }
+
+    #[test]
+    fn editing_commands_update_unprotected_fields() {
+        let mut ps = screen();
+        ps.apply_host_data(&[
+            CMD_ERASE_WRITE,
+            0x02,
+            ORDER_SF,
+            0x00,
+            0xc1,
+            0xc2,
+            0xc3,
+            0x40,
+        ])
+        .unwrap();
+        ps.set_cursor(0, 2);
+        ps.set_insert_mode(true);
+        assert!(ps.input_char('Z'));
+        assert_eq!(&ps.text_rows()[0][1..5], "AZBC");
+        assert!(ps.erase_eof());
+        assert_eq!(&ps.text_rows()[0][1..5], "AZ  ");
+        ps.erase_input();
+        assert_eq!(&ps.text_rows()[0][1..5], "    ");
+    }
+
+    #[test]
+    fn cursor_navigation_finds_unprotected_fields() {
+        let mut ps = screen();
+        ps.apply_host_data(&[
+            CMD_ERASE_WRITE,
+            0x02,
+            ORDER_SF,
+            0x20,
+            0xc1,
+            0xc2,
+            ORDER_SF,
+            0x00,
+            0x40,
+            0x40,
+        ])
+        .unwrap();
+        ps.home();
+        assert_eq!(ps.cursor(), Cursor { row: 0, col: 4 });
+        ps.move_cursor_relative(1, 2);
+        assert_eq!(ps.cursor(), Cursor { row: 1, col: 6 });
+        ps.backtab();
+        assert_eq!(ps.cursor(), Cursor { row: 0, col: 4 });
     }
 
     #[test]
