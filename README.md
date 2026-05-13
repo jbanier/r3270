@@ -17,3 +17,10 @@ cargo check --workspace
 cargo run -p r3270-app
 ```
 
+## Validation
+
+The workspace includes unit tests plus mock TN3270/TN3270E integration tests that run without a mainframe. When a real endpoint is available, use [docs/manual-smoke-test.md](docs/manual-smoke-test.md) and only commit sanitized golden traces.
+
+## Packaging
+
+Initial platform metadata lives under `packaging/`. The macOS `Info.plist` and Linux `.desktop` file are placeholders for release automation once the emulator behavior is stable enough to distribute.

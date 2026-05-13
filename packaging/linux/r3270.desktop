@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=r3270
+Comment=Rust TN3270/TN3270E terminal emulator
+Exec=r3270-app
+Terminal=false
+Categories=Network;TerminalEmulator;
+
